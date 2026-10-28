@@ -29,10 +29,13 @@ struct RootView: View {
                     }
                     .padding(.horizontal, 8)
                 } else {
-                    Button { model.startScan() } label: {
-                        Label("Rescan", systemImage: "arrow.clockwise")
+                    HStack(spacing: 10) {
+                        LiveIndicator()
+                        Button { model.startScan() } label: {
+                            Label("Full Rescan", systemImage: "arrow.clockwise")
+                        }
+                        .help("Rescan the whole disk from scratch (⌘R). Usually not needed: DiskBro tracks changes live.")
                     }
-                    .help("Rescan the whole disk (⌘R)")
                 }
             }
         }
@@ -113,5 +116,34 @@ struct SidebarStorageCard: View {
         }
         .padding(14)
         .glassEffect(.regular, in: .rect(cornerRadius: 16))
+    }
+}
+
+struct LiveIndicator: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        switch model.liveState {
+        case .off:
+            EmptyView()
+        case .catchingUp:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("Catching up…").foregroundStyle(.secondary)
+            }
+            .font(.callout)
+            .padding(.horizontal, 6)
+            .help("Applying changes made since the last session from the macOS file system journal")
+        case .live:
+            TimelineView(.periodic(from: .now, by: 30)) { _ in
+                HStack(spacing: 6) {
+                    Circle().fill(Palette.good).frame(width: 7, height: 7)
+                    Text("Live").foregroundStyle(.secondary)
+                }
+                .font(.callout)
+                .padding(.horizontal, 6)
+                .help("Watching for file changes. Last update \(Fmt.relative(model.lastLiveUpdate ?? .now)). Based on a full scan from \(Fmt.relative(model.lastScan ?? .now)).")
+            }
+        }
     }
 }

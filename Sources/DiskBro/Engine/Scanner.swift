@@ -55,6 +55,7 @@ final class DiskScanner: @unchecked Sendable {
     var deniedCount: Int { lock.withLock { $0.deniedCount } }
     func cancel() { lock.withLock { $0.cancelled = true } }
     private var isCancelled: Bool { lock.withLock { $0.cancelled } }
+    var wasCancelled: Bool { isCancelled }
 
     func scan() async -> FileNode {
         let root = FileNode(name: rootPath, flags: [.directory])
@@ -73,16 +74,16 @@ final class DiskScanner: @unchecked Sendable {
         } else {
             for (child, childPath) in subdirs { scanSync(child, path: childPath) }
         }
-        finalize(node)
+        Self.finalize(node)
     }
 
     private func scanSync(_ node: FileNode, path: String) {
         let subdirs = readDirectory(node, path: path)
         for (child, childPath) in subdirs { scanSync(child, path: childPath) }
-        finalize(node)
+        Self.finalize(node)
     }
 
-    private func finalize(_ node: FileNode) {
+    static func finalize(_ node: FileNode) {
         var size: Int64 = 0
         var count = 0
         for c in node.children {
@@ -92,6 +93,28 @@ final class DiskScanner: @unchecked Sendable {
         node.size = size
         node.fileCount = count
         node.children.sort { $0.size > $1.size }
+    }
+
+    /// Whether FSEvents changes under `path` should be ignored (other volumes, firmlink duplicates).
+    func isOutsideScan(_ path: String) -> Bool {
+        if !path.hasPrefix(rootPath) { return true }
+        return skipPaths.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    /// Re-reads one directory into a detached replacement node. With `recursive == false`, subdirectories
+    /// named in `knownSubdirs` are returned as `.placeholder` nodes so the caller can splice the existing
+    /// subtree back in; every other subdirectory is scanned fully.
+    func refreshDirectory(path: String, name: String, knownSubdirs: Set<String>, recursive: Bool) -> FileNode {
+        let temp = FileNode(name: name, flags: [.directory])
+        let subdirs = readDirectory(temp, path: path)
+        for (child, childPath) in subdirs {
+            if !recursive && knownSubdirs.contains(child.name) {
+                child.flags.insert(.placeholder)
+            } else {
+                scanSync(child, path: childPath)
+            }
+        }
+        return temp
     }
 
     private func readDirectory(_ node: FileNode, path: String) -> [(FileNode, String)] {

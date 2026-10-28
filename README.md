@@ -29,4 +29,11 @@ For complete numbers, grant DiskBro **Full Disk Access** in System Settings ▸ 
 
 ## How scanning works
 
+DiskBro does one full scan, then never needs another:
+
+- The tree is cached to `~/Library/Application Support/DiskBro/tree.cache`, along with the FSEvents event ID it's accurate up to. On launch it loads in well under a second.
+- The macOS FSEvents journal (persistent across restarts) is replayed from that ID, and only the directories that changed are re-read and spliced into the tree.
+- While the app is open, the same stream keeps the tree live.
+- A full rescan only happens when macOS reports that the journal can't be trusted (dropped events or wrapped IDs), when the cache is older than 30 days, or when you choose **Full Rescan** (⌘R).
+
 A parallel POSIX walker (`readdir` + `fstatat`) measures allocated blocks, counts hard links once, stays on the boot volumes, skips firmlink duplicates under `/System/Volumes`, and never triggers iCloud downloads of evicted folders. Files under 1 MB are folded into one entry per folder to keep memory low on multi-million-file disks.

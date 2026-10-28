@@ -50,8 +50,9 @@ struct OverviewView: View {
                     Spacer()
                     if let last = model.lastScan {
                         VStack(alignment: .trailing, spacing: 2) {
-                            Text("Scanned \(Fmt.relative(last))").font(.caption).foregroundStyle(.secondary)
-                            Text("\(model.progress.files.formatted()) files in \(Int(model.scanDuration)) s").font(.caption).foregroundStyle(.tertiary)
+                            Text(model.liveState == .live ? "Up to date · tracking changes live" : "Scanned \(Fmt.relative(last))")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text("\((model.root?.fileCount ?? 0).formatted()) files · full scan \(Fmt.relative(last))").font(.caption).foregroundStyle(.tertiary)
                         }
                     }
                 }

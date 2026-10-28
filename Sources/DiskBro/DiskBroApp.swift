@@ -12,13 +12,16 @@ struct DiskBroApp: App {
             RootView()
                 .environment(model)
                 .frame(minWidth: 1020, minHeight: 680)
-                .task { if model.scanState == .idle { model.startScan() } }
+                .task {
+                    AppDelegate.model = model
+                    await model.launch()
+                }
         }
         .defaultSize(width: 1280, height: 820)
         .windowToolbarStyle(.unified)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("Rescan Disk") { model.startScan() }
+                Button("Full Rescan") { model.startScan() }
                     .keyboardShortcut("r")
                     .disabled(model.scanState == .scanning)
             }
@@ -33,5 +36,11 @@ struct DiskBroApp: App {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    @MainActor static weak var model: AppModel?
+
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { Self.model?.saveCache() }
+    }
 }

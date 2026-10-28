@@ -10,6 +10,8 @@ final class FileNode: Identifiable, Hashable, @unchecked Sendable {
         static let package   = Flags(rawValue: 1 << 1)
         static let aggregate = Flags(rawValue: 1 << 2)
         static let denied    = Flags(rawValue: 1 << 3)
+        /// Marks a directory in a refresh result whose existing subtree should be reused.
+        static let placeholder = Flags(rawValue: 1 << 4)
     }
 
     var name: String

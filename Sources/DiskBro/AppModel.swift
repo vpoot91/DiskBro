@@ -169,14 +169,41 @@ final class AppModel {
 
     // MARK: - Scanning
 
+    /// On launch: restore the cached tree and catch up through the FSEvents journal; full scan only if needed.
+    func launch() async {
+        guard root == nil, scanState == .idle else { return }
+        let home = self.home
+        guard let (tree, meta) = await Task.detached(priority: .userInitiated, operation: { TreeCache.load(rootPath: "/") }).value,
+              Date.now.timeIntervalSince(meta.scanDate) < 30 * 86_400 else {
+            startScan()
+            return
+        }
+        root = tree
+        exploreFocus = tree.node(atPath: home) ?? tree
+        deniedPaths = meta.deniedPaths
+        deniedCount = meta.deniedCount
+        lastScan = meta.scanDate
+        scanDuration = meta.scanDuration
+        appliedEventId = meta.eventId
+        scanState = .done
+        liveState = .catchingUp
+        treeVersion += 1
+        breakdown = await Task.detached { CategoryBreakdown.compute(root: tree) }.value
+        startTracking(since: meta.eventId)
+    }
+
     func startScan() {
         guard scanState != .scanning else { return }
         hasFullDiskAccess = Permissions.hasFullDiskAccess()
+        stopTracking()
         let scanner = DiskScanner(rootPath: "/")
         self.scanner = scanner
+        let previousState = scanState
         scanState = .scanning
         progress = ScanProgress()
         let started = Date.now
+        // Changes made while the scan runs are replayed afterwards from this point in the journal.
+        let startEventId = ChangeTracker.currentEventId
 
         timer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -187,9 +214,20 @@ final class AppModel {
 
         Task {
             let tree = await Task.detached(priority: .userInitiated) { await scanner.scan() }.value
-            let breakdown = await Task.detached { CategoryBreakdown.compute(root: tree) }.value
-            let folders = await Task.detached { HistoryStore.folderMap(root: tree) }.value
             self.timer?.invalidate()
+            self.scanner = nil
+            if scanner.wasCancelled {
+                self.scanState = self.root == nil ? .idle : previousState
+                if self.root != nil { self.startTracking(since: self.appliedEventId) }
+                return
+            }
+            let duration = Date.now.timeIntervalSince(started)
+            let meta = TreeCache.Meta(eventId: startEventId, scanDate: .now, scanDuration: duration,
+                                      deniedCount: scanner.deniedCount, deniedPaths: scanner.deniedPaths)
+            let (breakdown, folders) = await Task.detached {
+                TreeCache.save(root: tree, meta: meta)
+                return (CategoryBreakdown.compute(root: tree), HistoryStore.folderMap(root: tree))
+            }.value
             self.progress = scanner.progress
             self.root = tree
             self.exploreFocus = tree.node(atPath: self.home) ?? tree
@@ -197,11 +235,13 @@ final class AppModel {
             self.deniedPaths = scanner.deniedPaths
             self.deniedCount = scanner.deniedCount
             self.lastScan = .now
-            self.scanDuration = Date.now.timeIntervalSince(started)
+            self.scanDuration = duration
+            self.appliedEventId = startEventId
             self.scanState = .done
             self.treeVersion += 1
             self.duplicateGroups = nil
-            self.scanner = nil
+            self.liveState = .catchingUp
+            self.startTracking(since: startEventId)
             await self.refreshSystemInfo()
             self.history.recordScan(self.volume, scanned: tree.size, folders: folders)
             self.historyVersion += 1
@@ -213,11 +253,200 @@ final class AppModel {
         scanner?.cancel()
     }
 
-    func rebuildRecommendations() async {
+    // MARK: - Live updates
+
+    enum LiveState { case off, catchingUp, live }
+    var liveState: LiveState = .off
+    var lastLiveUpdate: Date?
+    private var tracker: ChangeTracker?
+    private var appliedEventId: UInt64 = 0
+    private var pendingChanges: [String: Bool] = [:]   // path → recursive
+    private var pendingEventId: UInt64 = 0
+    private var pendingHistoryDone = false
+    private var applying = false
+    private var lastRecsBuild = Date.distantPast
+    private var derivedRefreshScheduled = false
+
+    private func startTracking(since eventId: UInt64) {
+        let tracker = ChangeTracker { [weak self] batch in
+            Task { @MainActor in self?.receive(batch) }
+        }
+        self.tracker = tracker
+        tracker.start(since: eventId)
+    }
+
+    private func stopTracking() {
+        tracker?.stop()
+        tracker = nil
+        liveState = .off
+        pendingChanges.removeAll()
+    }
+
+    private func receive(_ batch: ChangeTracker.Batch) {
+        guard tracker != nil, scanState == .done else { return }
+        if batch.needsFullScan {
+            stopTracking()
+            startScan()
+            return
+        }
+        for c in batch.changes { pendingChanges[c.path] = (pendingChanges[c.path] ?? false) || c.recursive }
+        pendingEventId = max(pendingEventId, batch.lastEventId)
+        if batch.historyDone { pendingHistoryDone = true }
+        if !applying { Task { await applyPendingChanges() } }
+    }
+
+    /// Re-reads only the directories FSEvents reported and splices the results into the tree.
+    private func applyPendingChanges() async {
+        guard let root, !applying else { return }
+        applying = true
+        defer { applying = false }
+
+        while !pendingChanges.isEmpty || pendingHistoryDone {
+            let changes = pendingChanges
+            let eventId = pendingEventId
+            let historyDone = pendingHistoryDone
+            pendingChanges.removeAll()
+            pendingHistoryDone = false
+
+            let probe = DiskScanner(rootPath: root.name)
+            // Collapse: drop anything inside a directory that's being re-read recursively.
+            let recursiveRoots = changes.filter(\.value).map(\.key)
+            var targets: [(node: FileNode, path: String, known: Set<String>, recursive: Bool)] = []
+            var seen = Set<ObjectIdentifier>()
+            for (path, recursive) in changes.sorted(by: { $0.key < $1.key }) {
+                if probe.isOutsideScan(path) { continue }
+                if recursiveRoots.contains(where: { $0 != path && path.hasPrefix($0 == "/" ? "/" : $0 + "/") }) { continue }
+                // Changed folder might be new; refresh its nearest known ancestor instead.
+                var node = root
+                var nodePath = root.name
+                var exact = true
+                for comp in path.split(separator: "/") {
+                    guard let next = node.child(named: String(comp)), next.isDirectory else { exact = false; break }
+                    node = next
+                    nodePath = nodePath == "/" ? "/" + comp : nodePath + "/" + comp
+                }
+                if node.isPackage && !exact { /* changes inside a bundle: refresh the bundle itself */ }
+                guard seen.insert(node.id).inserted else { continue }
+                let known = Set(node.children.filter(\.isDirectory).map(\.name))
+                targets.append((node, nodePath, known, recursive && exact))
+            }
+
+            let requests = targets.map { ($0.path, $0.node.name, $0.known, $0.recursive) }
+            let results = await Task.detached(priority: .utility) {
+                requests.map { probe.refreshDirectory(path: $0.0, name: $0.1, knownSubdirs: $0.2, recursive: $0.3) }
+            }.value
+
+            let focusPath = exploreFocus?.path
+            for (target, fresh) in zip(targets, results) {
+                splice(fresh, into: target.node, root: root)
+            }
+            if let focusPath, let f = exploreFocus, !(f === root || f.isDescendant(of: root)) {
+                exploreFocus = root.node(atPath: focusPath) ?? root.node(atPath: home) ?? root
+            }
+
+            appliedEventId = max(appliedEventId, eventId)
+            if !targets.isEmpty {
+                bumpTreeVersionThrottled()
+                lastLiveUpdate = .now
+            }
+            if historyDone && liveState == .catchingUp {
+                liveState = .live
+                lastLiveUpdate = .now
+                scheduleDerivedRefresh(full: true)
+                // Record the caught-up state so History can compare against it.
+                let folders = HistoryStore.folderMap(root: root)
+                if let last = history.scans.last, Date.now.timeIntervalSince(last.date) > 3600 {
+                    history.recordScan(volume, scanned: root.size, folders: folders)
+                    historyVersion += 1
+                }
+            } else if !targets.isEmpty {
+                scheduleDerivedRefresh(full: false)
+            }
+        }
+    }
+
+    private func splice(_ fresh: FileNode, into node: FileNode, root: FileNode) {
+        guard node === root || node.isDescendant(of: root) else { return }
+        let oldSize = node.size, oldCount = node.fileCount
+        var oldDirs: [String: FileNode] = [:]
+        for c in node.children where c.isDirectory { oldDirs[c.name] = c }
+        var children: [FileNode] = []
+        children.reserveCapacity(fresh.children.count)
+        for c in fresh.children {
+            if c.flags.contains(.placeholder), let old = oldDirs.removeValue(forKey: c.name) {
+                children.append(old)
+            } else {
+                c.flags.remove(.placeholder)
+                c.parent = node
+                children.append(c)
+            }
+        }
+        let kept = Set(children.map(\.id))
+        for c in node.children where !kept.contains(c.id) { c.parent = nil }
+        node.children = children
+        if fresh.isDenied { node.flags.insert(.denied) } else { node.flags.remove(.denied) }
+        DiskScanner.finalize(node)
+        let dSize = node.size - oldSize, dCount = node.fileCount - oldCount
+        guard dSize != 0 || dCount != 0 else { return }
+        var p = node.parent
+        while let n = p {
+            n.size += dSize
+            n.fileCount += dCount
+            n.children.sort { $0.size > $1.size }
+            p = n.parent
+        }
+    }
+
+    private var treeBumpScheduled = false
+
+    /// Background churn (caches, logs) changes the tree constantly; redraw views at most every 3 s for it.
+    private func bumpTreeVersionThrottled() {
+        guard !treeBumpScheduled else { return }
+        treeBumpScheduled = true
+        Task {
+            try? await Task.sleep(for: .seconds(3))
+            treeBumpScheduled = false
+            treeVersion += 1
+        }
+    }
+
+    /// Breakdown and recommendations are relatively expensive; refresh them at most every 30 s while live.
+    private func scheduleDerivedRefresh(full: Bool) {
+        guard !derivedRefreshScheduled else { return }
+        derivedRefreshScheduled = true
+        let delay = full ? 0 : max(0, 30 - Date.now.timeIntervalSince(lastRecsBuild))
+        Task {
+            try? await Task.sleep(for: .seconds(delay))
+            derivedRefreshScheduled = false
+            guard let root else { return }
+            breakdown = await Task.detached { CategoryBreakdown.compute(root: root) }.value
+            refreshVolume()
+            await rebuildRecommendations(includeSlow: full || Date.now.timeIntervalSince(lastSlowRecs) > 600)
+        }
+    }
+
+    /// Persists the live tree (called on quit) so the next launch replays only newer changes.
+    func saveCache() {
+        guard let root, scanState == .done, appliedEventId > 0 else { return }
+        TreeCache.save(root: root, meta: TreeCache.Meta(eventId: appliedEventId, scanDate: lastScan ?? .now,
+                                                         scanDuration: scanDuration, deniedCount: deniedCount,
+                                                         deniedPaths: deniedPaths))
+    }
+
+    private var lastSlowRecs = Date.distantPast
+
+    /// `includeSlow` reruns external tools (brew, simctl); otherwise their previous results are reused.
+    func rebuildRecommendations(includeSlow: Bool = true) async {
         guard let root else { return }
         recommendationsLoading = true
-        let engine = RecommendationEngine(root: root)
-        let recs = await Task.detached(priority: .utility) { await engine.build() }.value
+        lastRecsBuild = .now
+        if includeSlow { lastSlowRecs = .now }
+        let engine = RecommendationEngine(root: root, includeSlow: includeSlow)
+        var recs = await Task.detached(priority: .utility) { await engine.build() }.value
+        if !includeSlow {
+            let fresh = Set(recs.map(\.id))
+            recs += recommendations.filter { RecommendationEngine.slowIds.contains($0.id) && !fresh.contains($0.id) }
+        }
         var newSelections: [String: Set<String>] = [:]
         for r in recs {
             if let existing = selections[r.id] {

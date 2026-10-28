@@ -92,7 +92,11 @@ struct Recommendation: Identifiable, Sendable {
 /// Builds cleanup recommendations by looking at known locations in the scanned tree.
 struct RecommendationEngine: @unchecked Sendable {
     let root: FileNode
+    var includeSlow = true
     let home = NSHomeDirectory()
+
+    /// Recommendations that come from running external tools rather than from the tree.
+    static let slowIds: Set<String> = ["brew", "sim-unavailable", "sim-runtimes"]
     let fm = FileManager.default
 
     private let MB: Int64 = 1 << 20
@@ -209,7 +213,7 @@ struct RecommendationEngine: @unchecked Sendable {
                            symbol: "ipad.and.iphone", safety: .safe, group: .developer,
                            entries: simCaches, action: .trash), min: 20 * MB)
 
-        if FileManager.default.fileExists(atPath: "/usr/bin/xcrun") {
+        if includeSlow && FileManager.default.fileExists(atPath: "/usr/bin/xcrun") {
             recs += await simulatorRecommendations()
         }
 
@@ -234,7 +238,7 @@ struct RecommendationEngine: @unchecked Sendable {
                            symbol: "shippingbox", safety: .safe, group: .developer,
                            entries: pkgCaches.sorted { $0.size > $1.size }, action: .trash), min: 50 * MB)
 
-        if let brew = Shell.which("brew") {
+        if includeSlow, let brew = Shell.which("brew") {
             let dry = await Shell.run(brew, ["cleanup", "--prune=all", "-n"])
             if let size = parseBrewEstimate(dry.combined), size >= 50 * MB {
                 recs.append(Recommendation(id: "brew", title: "Homebrew cleanup",
@@ -479,6 +483,7 @@ struct RecommendationEngine: @unchecked Sendable {
     private func unusedApps() -> [Recommendation] {
         var entries: [CleanupEntry] = []
         let selfPath = Bundle.main.bundlePath
+        let running = Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
         for base in ["/Applications", home + "/Applications"] {
             guard let dir = node(base) else { continue }
             var apps: [FileNode] = []
@@ -487,13 +492,13 @@ struct RecommendationEngine: @unchecked Sendable {
                 else if !c.isPackage { apps += c.children.filter { $0.name.hasSuffix(".app") } } // e.g. /Applications/Utilities-like folders
             }
             for app in apps where app.size >= 50 * MB && app.path != selfPath {
-                var lastUsed: Date?
-                if let item = MDItemCreate(nil, app.path as CFString),
-                   let d = MDItemCopyAttribute(item, kMDItemLastUsedDate) as? Date { lastUsed = d }
+                let bundle = Bundle(path: app.path)
+                if let id = bundle?.bundleIdentifier, running.contains(id) { continue }
+                let lastUsed = lastUsedDate(appPath: app.path, bundle: bundle)
                 let days = lastUsed.map(daysAgo) ?? Int.max
                 guard days > 90 else { continue }
                 var e = entry(app, name: (app.name as NSString).deletingPathExtension,
-                              detail: lastUsed.map { "Last opened " + Fmt.age($0) } ?? "Never opened on this Mac",
+                              detail: lastUsed.map { "Last used " + Fmt.age($0) } ?? "No usage recorded",
                               preselected: false)
                 e.lastUsed = lastUsed
                 entries.append(e)
@@ -501,8 +506,27 @@ struct RecommendationEngine: @unchecked Sendable {
         }
         guard entries.reduce(0, { $0 + $1.size }) >= 100 * MB else { return [] }
         return [Recommendation(id: "unused-apps", title: "Apps you don't use",
-                               summary: "Apps not opened in the last 3 months. You can reinstall App Store apps anytime from your purchases.",
+                               summary: "Apps with no sign of use in the last 3 months, judged by when the app last ran and when it last saved settings or data. You can reinstall App Store apps anytime from your purchases.",
                                symbol: "app.dashed", safety: .review, group: .apps,
                                entries: entries.sorted { $0.size > $1.size }, action: .trash)]
+    }
+
+    /// Spotlight's kMDItemLastUsedDate is often missing, so combine it with traces an app leaves
+    /// when it runs: the executable's access time and its preferences, container and saved state.
+    private func lastUsedDate(appPath: String, bundle: Bundle?) -> Date? {
+        var dates: [Date] = []
+        if let item = MDItemCreate(nil, appPath as CFString),
+           let d = MDItemCopyAttribute(item, kMDItemLastUsedDate) as? Date { dates.append(d) }
+        if let exe = bundle?.executablePath {
+            var st = stat()
+            if stat(exe, &st) == 0 { dates.append(Date(timeIntervalSince1970: Double(st.st_atimespec.tv_sec))) }
+        }
+        if let id = bundle?.bundleIdentifier {
+            for p in ["/Library/Preferences/\(id).plist", "/Library/Containers/\(id)", "/Library/Saved Application State/\(id).savedState",
+                      "/Library/Application Support/\(id)", "/Library/Caches/\(id)"] {
+                if let m = (try? fm.attributesOfItem(atPath: home + p))?[.modificationDate] as? Date { dates.append(m) }
+            }
+        }
+        return dates.max()
     }
 }
